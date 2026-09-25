@@ -1,0 +1,10 @@
+{
+  "name": "prefrios-push-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Revisa los 16 tuneles de Registro de Prefrios y manda notificaciones push (con vibracion) cuando alguno esta por llegar o ya llego a su hora de inversion/termino.",
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "web-push": "^3.6.7"
+  }
+}
