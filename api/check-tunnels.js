@@ -99,7 +99,22 @@ module.exports = async (req, res) => {
     const tunnelsKey = `prefrios:tunnels-global:${temporada}`;
     const tunnelsSnap = await db.collection('kv').doc(encodeURIComponent(tunnelsKey)).get();
     if (!tunnelsSnap.exists) {
-      res.status(200).json({ ok: true, checked: 0, notified: 0, note: 'sin datos de túneles todavía' });
+      // --- DIAGNÓSTICO TEMPORAL (quitar una vez resuelto) ---
+      let debug = {};
+      try {
+        let credProjectId = null;
+        try { credProjectId = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '{}').project_id; } catch (e2) {}
+        const kvList = await db.collection('kv').limit(30).get();
+        debug = {
+          credencialProjectId: credProjectId,
+          temporadaLeida: temporada,
+          temporadaDocExiste: temporadaSnap.exists,
+          claveBuscada: tunnelsKey,
+          claveBuscadaCodificada: encodeURIComponent(tunnelsKey),
+          documentosEnKv: kvList.docs.map((d) => d.id),
+        };
+      } catch (e3) { debug = { debugError: e3.message }; }
+      res.status(200).json({ ok: true, checked: 0, notified: 0, note: 'sin datos de túneles todavía', debug });
       return;
     }
     let parsed;
