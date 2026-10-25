@@ -74,6 +74,32 @@ function getFirebaseAdmin() {
   return admin;
 }
 
+// --- Contador de consumo de Firebase del propio servidor ---
+// Cuenta lo que lee/escribe este servidor y lo suma (cada ~10 minutos) al documento del día,
+// para que el panel "Consumo de Firebase" de la app muestre también esto.
+const uso = { sr: 0, sw: 0, sd: 0, sdn: 0 };
+let ultimoVolcado = 0;
+let cacheTemporada = { valor: null, en: 0 };
+function diaPacifico() {
+  try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date()); }
+  catch (e) { return new Date().toISOString().slice(0, 10); }
+}
+async function volcarUso(db, fb) {
+  if (Date.now() - ultimoVolcado < 10 * 60 * 1000) return;
+  if (!(uso.sr || uso.sw || uso.sd || uso.sdn)) return;
+  const inc = fb.firestore.FieldValue.increment;
+  const dia = diaPacifico();
+  const copia = { ...uso };
+  const batch = db.batch();
+  batch.set(db.collection('kv').doc(encodeURIComponent('uso-prefrios:' + dia)), { sr: inc(copia.sr), sw: inc(copia.sw + 2), sd: inc(copia.sd), dia }, { merge: true });
+  batch.set(db.collection('kv').doc(encodeURIComponent('uso-prefrios:m-' + dia.slice(0, 7))), { sdn: inc(copia.sdn), mes: dia.slice(0, 7) }, { merge: true });
+  await batch.commit();
+  uso.sr -= copia.sr; uso.sw -= copia.sw; uso.sd -= copia.sd; uso.sdn -= copia.sdn;
+  ultimoVolcado = Date.now();
+}
+
+async function volcarSeguro(db, fb) { try { await volcarUso(db, fb); } catch (e) { console.error('uso', e && e.message); } }
+
 module.exports = async (req, res) => {
   const secret = req.headers['x-cron-secret'] || req.query.secret;
   if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
@@ -92,19 +118,29 @@ module.exports = async (req, res) => {
     );
 
     // 1) Temporada actual
-    const temporadaSnap = await db.collection('kv').doc(encodeURIComponent('prefrios:temporada-actual')).get();
-    const temporada = temporadaSnap.exists ? temporadaSnap.data().value : '2026-27';
+    //    (se recuerda 10 minutos para no leerla en cada revisión: ahorra lecturas del plan gratis)
+    let temporada;
+    if (cacheTemporada.valor && Date.now() - cacheTemporada.en < 10 * 60 * 1000) {
+      temporada = cacheTemporada.valor;
+    } else {
+      const temporadaSnap = await db.collection('kv').doc(encodeURIComponent('prefrios:temporada-actual')).get();
+      uso.sr += 1;
+      temporada = temporadaSnap.exists ? temporadaSnap.data().value : '2026-27';
+      cacheTemporada = { valor: temporada, en: Date.now() };
+    }
 
     // 2) Datos de los túneles de esa temporada
     const tunnelsKey = `prefrios:tunnels-global:${temporada}`;
     const tunnelsSnap = await db.collection('kv').doc(encodeURIComponent(tunnelsKey)).get();
+    uso.sr += 1;
+    if (tunnelsSnap.exists) { try { uso.sdn += String(tunnelsSnap.data().value || '').length; } catch (e) {} }
     if (!tunnelsSnap.exists) {
-      res.status(200).json({ ok: true, checked: 0, notified: 0, note: 'sin datos de túneles todavía' });
+      await volcarSeguro(db, fb); res.status(200).json({ ok: true, checked: 0, notified: 0, note: 'sin datos de túneles todavía' });
       return;
     }
     let parsed;
     try { parsed = JSON.parse(tunnelsSnap.data().value); } catch (e) {
-      res.status(200).json({ ok: true, checked: 0, notified: 0, note: 'datos de túneles no legibles' });
+      await volcarSeguro(db, fb); res.status(200).json({ ok: true, checked: 0, notified: 0, note: 'datos de túneles no legibles' });
       return;
     }
     const tunnels = (parsed && parsed.tunnels) || {};
@@ -114,7 +150,13 @@ module.exports = async (req, res) => {
     //    revisión (para avisar solo una vez por evento, igual que en la app).
     const toNotify = [];
     const stateUpdates = [];
+    const activeKeys = new Set();   // anotaciones que corresponden a lotes activos ahora
     let checked = 0;
+
+    // Una sola lectura de todas las anotaciones (antes era una lectura por lote activo, cada minuto).
+    const estadoSnap = await db.collection('push-state').get();
+    uso.sr += Math.max(1, estadoSnap.docs.length);
+    const estadoPorId = new Map(estadoSnap.docs.map((d) => [d.id, d.data()]));
 
     for (let i = 1; i <= TUNNEL_COUNT; i++) {
       const lotes = (tunnels[i] && tunnels[i].lotes) || [];
@@ -124,15 +166,23 @@ module.exports = async (req, res) => {
         if (!st) continue;
         checked++;
         const stateKey = `${temporada}-${i}-${li}-${st.nextEvent}`;
+        activeKeys.add(stateKey);
+        // "firma" del ciclo: si el lote es otro proceso (otra hora/fecha de inicio o duración),
+        // la anotación vieja no vale y se vuelve a avisar desde cero.
+        const sig = `${lote.fechaProceso || ''}|${lote.horaInicio}|${lote.duracionTotal || ''}`;
         const stateRef = db.collection('push-state').doc(stateKey);
-        const stateSnap = await stateRef.get();
-        const lastNivel = stateSnap.exists ? stateSnap.data().nivel : null;
+        const stored = estadoPorId.has(stateKey) ? estadoPorId.get(stateKey) : null;
+        const mismoCiclo = !!stored && (!stored.sig || stored.sig === sig);
+        const lastNivel = mismoCiclo ? stored.nivel : null;
         if (st.nivel && st.nivel !== lastNivel) {
           toNotify.push({ tunnel: i, loteIndex: li, ...st });
-          stateUpdates.push(() => stateRef.set({ nivel: st.nivel, updatedAt: fb.firestore.FieldValue.serverTimestamp() }));
-        } else if (!st.nivel && lastNivel) {
+          stateUpdates.push(() => stateRef.set({ nivel: st.nivel, sig, updatedAt: fb.firestore.FieldValue.serverTimestamp() }));
+        } else if (!st.nivel && stored) {
           // Volvió a la normalidad (se registró la inversión/término a tiempo): limpia el estado.
           stateUpdates.push(() => stateRef.delete());
+        } else if (stored && !stored.sig) {
+          // Anotación antigua sin firma: se le agrega, sin avisar de nuevo.
+          stateUpdates.push(() => stateRef.set({ nivel: stored.nivel, sig }, { merge: true }));
         }
       }
     }
@@ -141,6 +191,7 @@ module.exports = async (req, res) => {
     let notified = 0;
     if (toNotify.length) {
       const subsSnap = await db.collection('push-subscriptions').get();
+      uso.sr += Math.max(1, subsSnap.docs.length);
       // enabled === false -> esa persona silenció los avisos en su celular (p.ej. al salir
       // del turno); se respeta y no se le manda nada hasta que lo reactive.
       const subs = subsSnap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((s) => s.enabled !== false);
@@ -202,8 +253,19 @@ module.exports = async (req, res) => {
     }
 
     await Promise.all(stateUpdates.map((fn) => fn()));
+    uso.sw += stateUpdates.length;
 
-    res.status(200).json({ ok: true, checked, avisos: toNotify.length, notificacionesEnviadas: notified });
+    // 5) Limpieza: borra anotaciones de lotes que ya no están activos (terminaron, se vaciaron
+    //    o cambió el evento esperado). Sin esto quedaban pegadas y tapaban avisos del ciclo siguiente.
+    let limpiadas = 0;
+    try {
+      const borrar = estadoSnap.docs.filter((d) => d.id.startsWith(`${temporada}-`) && !activeKeys.has(d.id));
+      await Promise.all(borrar.map((d) => d.ref ? d.ref.delete() : db.collection('push-state').doc(d.id).delete()));
+      limpiadas = borrar.length;
+      uso.sd += borrar.length;
+    } catch (e) { console.error('limpieza push-state', e && e.message); }
+
+    await volcarSeguro(db, fb); res.status(200).json({ ok: true, checked, avisos: toNotify.length, notificacionesEnviadas: notified, anotacionesLimpiadas: limpiadas });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
