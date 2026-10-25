@@ -34,43 +34,13 @@ function addHoursToDate(d, hours) {
   return new Date(d.getTime() + Math.round(hours * 60) * 60000);
 }
 
-// El servidor (Vercel) corre con su propio reloj interno, casi siempre en UTC, no en la hora
-// de Chile. Si construyéramos la fecha con los componentes locales del servidor (como se hace
-// en la app, que sí corre en el celular/PC de Chile), quedaría desfasada varias horas. Estas
-// dos funciones leen la hora "de pared" y el desfase horario real de Santiago en este instante
-// (considerando el cambio de horario de verano/invierno), para anclar todo correctamente.
-const APP_TIMEZONE = 'America/Santiago';
-
-function getTimeZoneOffsetMinutes(date, timeZone) {
-  const dtf = new Intl.DateTimeFormat('en-US', {
-    timeZone, hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
-  const parts = dtf.formatToParts(date).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
-  const hour = parts.hour === '24' ? '00' : parts.hour;
-  const asUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +hour, +parts.minute, +parts.second);
-  return (asUTC - date.getTime()) / 60000;
-}
-
-function todayPartsInZone(date, timeZone) {
-  const dtf = new Intl.DateTimeFormat('en-US', {
-    timeZone, hour12: false, year: 'numeric', month: '2-digit', day: '2-digit',
-  });
-  const parts = dtf.formatToParts(date).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
-  return { year: +parts.year, month: +parts.month, day: +parts.day };
-}
-
-// Igual que resolveInicioDate en la app: ancla la hora de inicio en el día real de hoy (según
-// la hora de Chile, no la del servidor), y si queda más de 2h en el futuro, asume que en
-// realidad fue ayer (turno de la noche anterior).
+// Igual que resolveInicioDate en la app: ancla la hora de inicio en el día real de hoy, y si
+// queda más de 2h en el futuro, asume que en realidad fue ayer (turno de la noche anterior).
 function resolveInicioDate(horaInicio, now) {
   if (!horaInicio) return null;
   const [h, m] = horaInicio.split(':').map(Number);
   if (isNaN(h) || isNaN(m)) return null;
-  const { year, month, day } = todayPartsInZone(now, APP_TIMEZONE);
-  const offsetMin = getTimeZoneOffsetMinutes(now, APP_TIMEZONE);
-  let d = new Date(Date.UTC(year, month - 1, day, h, m, 0, 0) - offsetMin * 60000);
+  let d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
   if (d.getTime() - now.getTime() > 2 * 60 * 60 * 1000) {
     d = new Date(d.getTime() - 24 * 60 * 60 * 1000);
   }
@@ -144,7 +114,6 @@ module.exports = async (req, res) => {
     //    revisión (para avisar solo una vez por evento, igual que en la app).
     const toNotify = [];
     const stateUpdates = [];
-    const detalle = [];
     let checked = 0;
 
     for (let i = 1; i <= TUNNEL_COUNT; i++) {
@@ -154,10 +123,6 @@ module.exports = async (req, res) => {
         const st = loteStatus(lote, now);
         if (!st) continue;
         checked++;
-        detalle.push({
-          tunel: i, lote: li, horaInicio: lote.horaInicio,
-          proximoEvento: st.nextEvent, minutosParaEvento: Math.round(st.diffMinutes), nivel: st.nivel,
-        });
         const stateKey = `${temporada}-${i}-${li}-${st.nextEvent}`;
         const stateRef = db.collection('push-state').doc(stateKey);
         const stateSnap = await stateRef.get();
@@ -178,7 +143,7 @@ module.exports = async (req, res) => {
       const subsSnap = await db.collection('push-subscriptions').get();
       // enabled === false -> esa persona silenció los avisos en su celular (p.ej. al salir
       // del turno); se respeta y no se le manda nada hasta que lo reactive.
-      const subs = subsSnap.docs.map((d) => d.data()).filter((s) => s.enabled !== false);
+      const subs = subsSnap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((s) => s.enabled !== false);
       for (const item of toNotify) {
         const loteLabel = lotesMultiplesLabel(tunnels[item.tunnel], item.loteIndex);
         const title = item.nivel === 'rojo'
@@ -189,13 +154,47 @@ module.exports = async (req, res) => {
           : (item.nextEvent === 'inversion' ? 'Inversión en menos de 5 minutos' : 'Término en menos de 5 minutos');
         const payload = JSON.stringify({ title, body, nivel: item.nivel, tag: `tunel-${item.tunnel}-${item.nextEvent}` });
         for (const sub of subs) {
+          // --- APK de Android: aviso por Firebase Cloud Messaging ---
+          if (sub.type === 'fcm') {
+            try {
+              await fb.messaging().send({
+                token: sub.token,
+                notification: { title, body },
+                data: { nivel: String(item.nivel), tag: `tunel-${item.tunnel}-${item.nextEvent}` },
+                android: {
+                  priority: 'high',
+                  notification: {
+                    channelId: 'avisos',
+                    tag: `tunel-${item.tunnel}-${item.nextEvent}`,
+                    sound: 'default',
+                    defaultVibrateTimings: true,
+                    priority: 'max',
+                    icon: 'ic_stat_prefrios',
+                    color: '#0E7C86',
+                  },
+                },
+              });
+              notified++;
+            } catch (err) {
+              const c = err && err.code;
+              if (c === 'messaging/registration-token-not-registered' || c === 'messaging/invalid-registration-token' || c === 'messaging/invalid-argument') {
+                // El celular ya no existe (se desinstaló la app, etc.): se borra.
+                await db.collection('push-subscriptions').doc(sub.id).delete().catch(() => {});
+              } else {
+                console.error('FCM error', c, err && err.message);
+              }
+            }
+            continue;
+          }
+          // --- Navegador / PWA: Web Push ---
+          if (!sub.endpoint) continue;
           try {
             await webpush.sendNotification({ endpoint: sub.endpoint, keys: sub.keys }, payload);
             notified++;
           } catch (err) {
             if (err.statusCode === 404 || err.statusCode === 410) {
               // La suscripción ya no existe (se desinstaló la app, etc.): se borra.
-              await db.collection('push-subscriptions').doc(encodeURIComponent(sub.endpoint)).delete().catch(() => {});
+              await db.collection('push-subscriptions').doc(sub.id).delete().catch(() => {});
             }
           }
         }
@@ -204,15 +203,7 @@ module.exports = async (req, res) => {
 
     await Promise.all(stateUpdates.map((fn) => fn()));
 
-    const subsCountSnap = await db.collection('push-subscriptions').get();
-    res.status(200).json({
-      ok: true,
-      checked,
-      avisos: toNotify.length,
-      notificacionesEnviadas: notified,
-      suscripcionesRegistradas: subsCountSnap.size,
-      detalle,
-    });
+    res.status(200).json({ ok: true, checked, avisos: toNotify.length, notificacionesEnviadas: notified });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
