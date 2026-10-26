@@ -34,13 +34,35 @@ function addHoursToDate(d, hours) {
   return new Date(d.getTime() + Math.round(hours * 60) * 60000);
 }
 
-// Igual que resolveInicioDate en la app: ancla la hora de inicio en el día real de hoy, y si
+// El servidor (Vercel) trabaja en hora UTC, pero las horas de los lotes se escriben en hora de Chile.
+// Por eso todo se calcula con la hora de Santiago, no con la hora del servidor.
+const TZ_CHILE = 'America/Santiago';
+function partesChile(date) {
+  const p = {};
+  new Intl.DateTimeFormat('en-US', { timeZone: TZ_CHILE, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric' })
+    .formatToParts(date).forEach((x) => { if (x.type !== 'literal') p[x.type] = parseInt(x.value, 10); });
+  return p;
+}
+function offsetChileMin(date) {
+  const p = partesChile(date);
+  return Math.round((Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute) - Math.floor(date.getTime() / 60000) * 60000) / 60000);
+}
+// Instante real que corresponde a una hora "de reloj" en Chile (año, mes, día, hora, minuto)
+function fechaChile(y, mo, d, h, mi) {
+  const aprox = Date.UTC(y, mo - 1, d, h, mi);
+  let t = aprox - offsetChileMin(new Date(aprox)) * 60000;
+  t = aprox - offsetChileMin(new Date(t)) * 60000; // reajuste por cambio de horario
+  return new Date(t);
+}
+
+// Igual que resolveInicioDate en la app: ancla la hora de inicio en el día real de hoy (en Chile), y si
 // queda más de 2h en el futuro, asume que en realidad fue ayer (turno de la noche anterior).
 function resolveInicioDate(horaInicio, now) {
   if (!horaInicio) return null;
   const [h, m] = horaInicio.split(':').map(Number);
   if (isNaN(h) || isNaN(m)) return null;
-  let d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
+  const hoy = partesChile(now);
+  let d = fechaChile(hoy.year, hoy.month, hoy.day, h, m);
   if (d.getTime() - now.getTime() > 2 * 60 * 60 * 1000) {
     d = new Date(d.getTime() - 24 * 60 * 60 * 1000);
   }
